@@ -66,6 +66,23 @@ def dump(name, text):
     log(f"artifact {name} ({len(text or '')} bytes)")
 
 
+def post_with_retry(s, url, data, headers=None, tries=3, timeout=60):
+    """No-IP occasionally drops the TLS connection mid-request; retry a few times.
+
+    The request never reached the server when it aborts this way, so replaying it
+    is safe (the 2FA code is not consumed by a connection that died early).
+    """
+    last = None
+    for attempt in range(tries):
+        try:
+            return s.post(url, data=data, headers=headers, timeout=timeout)
+        except (requests.ConnectionError, requests.Timeout) as exc:
+            last = exc
+            log(f"POST {url} aborted ({attempt + 1}/{tries}): {exc}")
+            time.sleep(3 * (attempt + 1))
+    raise last
+
+
 def token_of(html):
     for pattern in (r'name="_token"[^>]*value="([^"]+)"',
                     r'name="csrf-token"[^>]*content="([^"]+)"'):
@@ -253,8 +270,8 @@ def login(s, username, password):
         "should_show_questionnaire": "",
     }
     login_started = datetime.now(timezone.utc)
-    r = s.post(LOGIN_URL, data=payload, timeout=60,
-               headers={"Referer": LOGIN_URL, "Origin": BASE})
+    r = post_with_retry(s, LOGIN_URL, payload,
+                        headers={"Referer": LOGIN_URL, "Origin": BASE})
     log(f"POST /login -> {r.status_code} {r.url}")
     dump("02-after-login.html", r.text)
 
@@ -266,12 +283,12 @@ def login(s, username, password):
                 "2FA code unavailable: pass NOIP_2FA_CODE, use NOIP_2FA_WAIT_FILE, "
                 "or configure the NOIP_IMAP_* secrets"
             )
-        r = s.post(VERIFY_URL, data={
+        r = post_with_retry(s, VERIFY_URL, {
             "_token": token_of(r.text) or "",
             "type": "email_pin",
             "challenge_code": code,
             "trust_device": "1",
-        }, timeout=60, headers={"Referer": VERIFY_URL, "Origin": BASE})
+        }, headers={"Referer": VERIFY_URL, "Origin": BASE})
         log(f"POST /2fa/verify -> {r.status_code} {r.url}")
         dump("03-after-2fa.html", r.text)
         if "challenge_form" in r.text:
