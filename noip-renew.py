@@ -169,7 +169,7 @@ def signed_in(s, url=MY_URL):
     return None
 
 
-def imap_code(tries=12, max_age_minutes=20, min_time=None, exclude=None):
+def imap_code(tries=15, max_age_minutes=20, min_time=None, exclude=None):
     """Read the No-IP verification code that arrived after min_time.
 
     No-IP puts the code in the subject ("No-IP Verification Code: 123456"), so
@@ -233,10 +233,10 @@ def imap_code(tries=12, max_age_minutes=20, min_time=None, exclude=None):
                     box.logout()
                     return m.group(1)
             box.logout()
-            log(f"no fresh code yet (attempt {attempt + 1}/{tries})")
+            log(f"no fresh code yet, the mail usually lands within a minute (attempt {attempt + 1}/{tries})")
         except Exception as exc:
             log(f"imap attempt {attempt + 1} failed: {exc}")
-        time.sleep(6)
+        time.sleep(8)
     return None
 
 
