@@ -29,12 +29,14 @@ Env / secrets:
 import argparse
 import base64
 import email
+import email.utils
 import imaplib
 import json
 import os
 import re
 import sys
 import time
+from datetime import datetime, timedelta, timezone
 
 import requests
 
@@ -150,7 +152,15 @@ def signed_in(s, url=MY_URL):
     return None
 
 
-def imap_code(username_hint=None, tries=6):
+def imap_code(tries=12, max_age_minutes=20, min_time=None):
+    """Read the No-IP verification code that arrived after min_time.
+
+    No-IP puts the code in the subject ("No-IP Verification Code: 123456"), so
+    the subject is checked first and the body is only a fallback. Two filters
+    keep old codes out: messages older than max_age_minutes, and messages sent
+    before this login attempt (min_time). The search is retried because the mail
+    can take a few seconds to land.
+    """
     host = os.environ.get("NOIP_IMAP_HOST", "imap.qq.com")
     port = int(os.environ.get("NOIP_IMAP_PORT", "993"))
     user = os.environ.get("NOIP_IMAP_USER")
@@ -158,17 +168,37 @@ def imap_code(username_hint=None, tries=6):
     if not (user and password):
         return None
     log(f"reading mailbox {user} for the No-IP code")
+
     for attempt in range(tries):
         try:
             box = imaplib.IMAP4_SSL(host, port)
             box.login(user, password)
             box.select("INBOX")
-            typ, data = box.search(None, "UNSEEN")
-            ids = data[0].split() if data and data[0] else []
-            typ, data = box.search(None, '(FROM "noip")')
-            ids = sorted(set(ids) | set((data[0].split() if data and data[0] else [])))[-8:]
+            typ, data = box.search(None, '(FROM "noip.com")')
+            ids = (data[0].split() if data and data[0] else [])[-10:]
             for msg_id in reversed(ids):
-                typ, payload = box.fetch(msg_id, "(RFC822)")
+                typ, payload = box.fetch(msg_id, "(BODY.PEEK[HEADER.FIELDS (SUBJECT DATE)])")
+                head = payload[0][1].decode("utf-8", "ignore") if typ == "OK" else ""
+                subject = (re.search(r"Subject:\s*(.*)", head, re.I) or [None, ""])[1]
+                date_hdr = (re.search(r"Date:\s*(.*)", head, re.I) or [None, ""])[1].strip()
+                if date_hdr:
+                    try:
+                        when = email.utils.parsedate_to_datetime(date_hdr).astimezone(timezone.utc)
+                        age = (datetime.now(timezone.utc) - when).total_seconds() / 60
+                        if age > max_age_minutes:
+                            continue
+                        if min_time and when < min_time - timedelta(seconds=90):
+                            log(f"skip pre-login mail ({int(age)} min old): {subject.strip()[:50]}")
+                            continue
+                    except Exception:
+                        pass
+                m = re.search(r"(?<!\d)(\d{6})(?!\d)", subject)
+                if m:
+                    log(f"code from subject: {m.group(1)} ({subject.strip()[:60]})")
+                    box.store(msg_id, "+FLAGS", "\\Seen")
+                    box.logout()
+                    return m.group(1)
+                typ, payload = box.fetch(msg_id, "(BODY.PEEK[])")
                 if typ != "OK":
                     continue
                 msg = email.message_from_bytes(payload[0][1])
@@ -179,22 +209,21 @@ def imap_code(username_hint=None, tries=6):
                             body += part.get_payload(decode=True).decode("utf-8", "ignore")
                 else:
                     body = msg.get_payload(decode=True).decode("utf-8", "ignore")
-                subject = str(msg.get("Subject", ""))
-                if "no-ip" not in (subject + body).lower():
-                    continue
                 m = re.search(r"(?<!\d)(\d{6})(?!\d)", plain(body))
                 if m:
-                    log(f"code found in mailbox: {m.group(1)}")
+                    log(f"code from body: {m.group(1)}")
+                    box.store(msg_id, "+FLAGS", "\\Seen")
                     box.logout()
                     return m.group(1)
             box.logout()
+            log(f"no fresh code yet (attempt {attempt + 1}/{tries})")
         except Exception as exc:
             log(f"imap attempt {attempt + 1} failed: {exc}")
-        time.sleep(10)
+        time.sleep(6)
     return None
 
 
-def twofa_code():
+def twofa_code(min_time=None):
     code = os.environ.get("NOIP_2FA_CODE")
     if code:
         return re.sub(r"\D", "", code)[:6]
@@ -209,7 +238,7 @@ def twofa_code():
                     return value[:6]
             time.sleep(2)
         return None
-    return imap_code()
+    return imap_code(min_time=min_time)
 
 
 def login(s, username, password):
@@ -223,6 +252,7 @@ def login(s, username, password):
         "intended_hash": "",
         "should_show_questionnaire": "",
     }
+    login_started = datetime.now(timezone.utc)
     r = s.post(LOGIN_URL, data=payload, timeout=60,
                headers={"Referer": LOGIN_URL, "Origin": BASE})
     log(f"POST /login -> {r.status_code} {r.url}")
@@ -230,7 +260,7 @@ def login(s, username, password):
 
     if "/2fa" in r.url or "challenge_form" in r.text:
         log("e-mail 2FA challenge")
-        code = twofa_code()
+        code = twofa_code(login_started)
         if not code:
             raise RuntimeError(
                 "2FA code unavailable: pass NOIP_2FA_CODE, use NOIP_2FA_WAIT_FILE, "
