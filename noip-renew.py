@@ -258,7 +258,8 @@ def twofa_code(min_time=None, exclude=None):
     return imap_code(min_time=min_time, exclude=exclude)
 
 
-def login(s, username, password):
+def _login_once(s, username, password):
+    """One full login round: form POST, then the 2FA challenge if it comes up."""
     r = s.get(LOGIN_URL, timeout=45)
     dump("01-login.html", r.text)
     payload = {
@@ -277,38 +278,56 @@ def login(s, username, password):
 
     if "/2fa" in r.url or "challenge_form" in r.text:
         log("e-mail 2FA challenge")
-        used = set()
-        challenge_token = token_of(r.text) or ""
-        last = None
-        for attempt in range(1, 4):
-            code = twofa_code(login_started, exclude=used)
-            if not code:
-                raise RuntimeError(
-                    "2FA code unavailable: pass NOIP_2FA_CODE, use NOIP_2FA_WAIT_FILE, "
-                    "or configure the NOIP_IMAP_* secrets"
-                )
-            used.add(code)
-            last = post_with_retry(s, VERIFY_URL, {
-                "_token": challenge_token,
-                "type": "email_pin",
-                "challenge_code": code,
-                "trust_device": "1",
-            }, headers={"Referer": VERIFY_URL, "Origin": BASE})
-            log(f"POST /2fa/verify -> {last.status_code} {last.url} (code {code}, try {attempt})")
-            dump(f"03-after-2fa-{attempt}.html", last.text)
-            if "challenge_form" not in last.text:
-                r = last
-                break
-            log("code rejected, waiting for a newer verification mail")
-            time.sleep(10)
-        else:
-            raise RuntimeError("2FA rejected 3 times (see artifacts)")
+        code = twofa_code(login_started)
+        if not code:
+            raise RuntimeError(
+                "2FA code unavailable: pass NOIP_2FA_CODE, use NOIP_2FA_WAIT_FILE, "
+                "or configure the NOIP_IMAP_* secrets"
+            )
+        data = {
+            "_token": token_of(r.text) or "",
+            "type": "email_pin",
+            "challenge_code": code,
+            "trust_device": "1",
+        }
+        try:
+            v = s.post(VERIFY_URL, data=data, timeout=60,
+                       headers={"Referer": VERIFY_URL, "Origin": BASE})
+        except (requests.ConnectionError, requests.Timeout) as exc:
+            # The connection can die after the body was already delivered, which
+            # burns the single-use code. Retrying the same code would be rejected
+            # and the server answers by dropping the session, so start over with
+            # a fresh challenge instead.
+            log(f"POST /2fa/verify aborted: {exc} -> retrying with a new challenge")
+            return False
+        log(f"POST /2fa/verify -> {v.status_code} {v.url} (code {code})")
+        dump("03-after-2fa.html", v.text)
+        if "challenge_form" in v.text or v.url.rstrip("/").endswith("/login"):
+            log("code not accepted (used or expired)")
+            return False
 
-    probe = signed_in(s)
-    if not probe:
-        raise RuntimeError("still signed out after login (see artifacts)")
-    dump("04-dashboard.html", probe.text)
-    log("signed in")
+    return True
+
+
+def login(s, username, password, rounds=3):
+    for attempt in range(1, rounds + 1):
+        try:
+            if _login_once(s, username, password):
+                probe = signed_in(s)
+                if probe:
+                    dump("04-dashboard.html", probe.text)
+                    log("signed in")
+                    return
+                log("still signed out after login")
+        except RuntimeError as exc:
+            if "code unavailable" in str(exc):
+                raise
+            log(f"login round {attempt} error: {exc}")
+        if attempt < rounds:
+            log(f"login round {attempt}/{rounds} did not get in, restarting session")
+            s.cookies.clear()
+            time.sleep(12)
+    raise RuntimeError("login failed after %d rounds (see artifacts)" % rounds)
 
 
 # ---------------------------------------------------------------- hosts
