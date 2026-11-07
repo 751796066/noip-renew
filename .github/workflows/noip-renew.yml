@@ -1,0 +1,48 @@
+name: noip-renew
+
+on:
+  schedule:
+    # every 5 days at 03:00 UTC - free hosts can be confirmed from day 23,
+    # so this always lands inside the 7-day confirmation window
+    - cron: "0 3 */5 * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: noip-renew
+  cancel-in-progress: false
+
+jobs:
+  renew:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Confirm No-IP hosts
+        env:
+          NOIP_USERNAME: ${{ secrets.NOIP_USERNAME }}
+          NOIP_PASSWORD: ${{ secrets.NOIP_PASSWORD }}
+          NOIP_DEBUG: "2"
+          ARTIFACT_DIR: artifacts
+        run: python noip-renew.py
+
+      - name: Upload debug artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: noip-renew-artifacts-${{ github.run_id }}
+          path: artifacts
+          if-no-files-found: warn
+          retention-days: 14
