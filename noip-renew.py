@@ -1,46 +1,51 @@
 #!/usr/bin/env python3
-"""No-IP free host auto-confirm (modernized fork of loblab/noip-renew).
+"""No-IP free host auto-confirm - HTTP-only fork of loblab/noip-renew.
 
-Upstream 1.2 relied on Selenium 3 helpers, a base64 password blob and a
-crontab self-reschedule. This version:
-  * uses the Selenium 4 API
-  * takes the password literally
-  * is driven by GitHub Actions cron instead of editing crontab
-  * handles No-IP's email 2FA ("trust this device for 30 days") and can persist
-    the resulting trust cookies, so unattended runs skip the code prompt
-  * writes screenshots/HTML into ARTIFACT_DIR for diagnosis
+Why this fork exists: the upstream Selenium script targets the 2021 site and the
+Selenium 3 API, and the free-host dashboard is now plain form POSTs. Talking to
+No-IP over HTTP keeps a run at a few seconds, never hangs on page overlays and
+needs no Chromium on the runner.
+
+Flow:
+    1. reuse the trusted-device cookie jar (skips No-IP's e-mail 2FA)
+    2. otherwise sign in: POST /login -> POST /2fa/verify (trust_device=1)
+       the code comes from NOIP_2FA_CODE, a wait file, or the mailbox over IMAP
+    3. read the dashboard / DNS records page and find the free hostname
+    4. if the "Confirm" control is on the page (it appears on day 23 of each
+       30-day cycle), submit it; otherwise report "nothing to confirm"
 
 Usage:
-    noip-renew.py                       # reads env / secret values
-    noip-renew.py --username U --password P [--debug 2]
+    noip-renew.py [--username U] [--password P] [--debug 2]
 
-Env:
+Env / secrets:
     NOIP_USERNAME, NOIP_PASSWORD
-    NOIP_2FA_CODE        optional 6-digit code passed in directly
-    NOIP_2FA_WAIT_FILE   optional file polled for the 6-digit code (interactive)
-    NOIP_COOKIES         optional base64(json) cookie jar carried between runs
-    NOIP_COOKIE_FILE     optional path to store/refresh the cookie jar
-    NOIP_DEBUG, ARTIFACT_DIR, CHROME_BIN
+    NOIP_COOKIES        base64(json) trusted session (survives between runs)
+    NOIP_COOKIE_FILE    default noip-cookies.json
+    NOIP_2FA_CODE       explicit code
+    NOIP_2FA_WAIT_FILE  poll a file for the code (interactive bootstrap)
+    NOIP_IMAP_HOST/PORT/USER/PASS   optional: fetch the code from the mailbox
+    NOIP_DEBUG, ARTIFACT_DIR
 """
 import argparse
 import base64
+import email
+import imaplib
 import json
 import os
 import re
 import sys
 import time
-from urllib.parse import urlsplit
 
-from selenium import webdriver
-from selenium.common.exceptions import TimeoutException, WebDriverException
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.common.by import By
+import requests
 
-LOGIN_URL = "https://www.noip.com/login"
-HOME_URL = "https://my.noip.com/"
-HOST_URLS = ["https://my.noip.com/#!/dynamic-dns", "https://my.noip.com/"]
+BASE = "https://www.noip.com"
+LOGIN_URL = BASE + "/login"
+VERIFY_URL = BASE + "/2fa/verify"
+MY_URL = "https://my.noip.com/"
+RECORDS_URL = "https://my.noip.com/dns/records"
+LEGACY_RECORDS = "https://my.noip.com/dns/records/legacy/mynetgear.com"
 USER_AGENT = (
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/140.0.0.0 Safari/537.36"
 )
 ARTIFACT_DIR = os.environ.get("ARTIFACT_DIR", "artifacts")
@@ -52,280 +57,297 @@ def log(msg, level=1):
         print(f"[{time.strftime('%Y/%m/%d %H:%M:%S')}] {msg}", flush=True)
 
 
-def save(driver, name):
+def dump(name, text):
     os.makedirs(ARTIFACT_DIR, exist_ok=True)
-    path = os.path.join(ARTIFACT_DIR, name)
-    try:
-        driver.save_screenshot(path)
-    except Exception as exc:
-        log(f"screenshot {name} failed: {exc}")
-    return path
+    with open(os.path.join(ARTIFACT_DIR, name), "w", encoding="utf-8") as fh:
+        fh.write(text or "")
+    log(f"artifact {name} ({len(text or '')} bytes)")
 
 
-def dump_page(driver, name):
-    os.makedirs(ARTIFACT_DIR, exist_ok=True)
-    path = os.path.join(ARTIFACT_DIR, name)
-    try:
-        with open(path, "w", encoding="utf-8") as fh:
-            fh.write(driver.page_source)
-    except Exception as exc:
-        log(f"page dump {name} failed: {exc}")
+def token_of(html):
+    for pattern in (r'name="_token"[^>]*value="([^"]+)"',
+                    r'name="csrf-token"[^>]*content="([^"]+)"'):
+        m = re.search(pattern, html or "")
+        if m:
+            return m.group(1)
+    return None
 
 
-def build_driver():
-    options = Options()
-    options.add_argument("--headless=new")
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--window-size=1400,1000")
-    options.add_argument(f"--user-agent={USER_AGENT}")
-    options.add_argument("--disable-features=VizDisplayCompositor")
-    options.add_argument("--disable-gpu")
-    binary = os.environ.get("CHROME_BIN")
-    if binary and os.path.exists(binary):
-        options.binary_location = binary
-    proxy = os.environ.get("https_proxy") or os.environ.get("HTTPS_PROXY")
-    if proxy:
-        # Chrome refuses a proxy URL carrying credentials (user:pass@host) with
-        # ERR_NO_SUPPORTED_PROXIES, so keep only scheme://host:port.
-        parts = urlsplit(proxy if "://" in proxy else "http://" + proxy)
-        if parts.hostname:
-            scheme = parts.scheme or "http"
-            port = f":{parts.port}" if parts.port else ""
-            options.add_argument(f"--proxy-server={scheme}://{parts.hostname}{port}")
-    driver = webdriver.Chrome(options=options)
-    driver.set_page_load_timeout(90)
-    return driver
+def plain(html):
+    text = re.sub(r"<script.*?</script>", " ", html or "", flags=re.S | re.I)
+    text = re.sub(r"<style.*?</style>", " ", text, flags=re.S | re.I)
+    text = re.sub(r"<[^>]+>", "\n", text)
+    text = re.sub(r"\n\s*\n+", "\n", text)
+    return text
+
+
+def session():
+    s = requests.Session()
+    s.headers.update({
+        "User-Agent": USER_AGENT,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    })
+    return s
 
 
 # ---------------------------------------------------------------- cookies
 
 
-def load_cookies(driver):
+def cookie_path():
+    return os.environ.get("NOIP_COOKIE_FILE", "noip-cookies.json")
+
+
+def load_cookies(s):
     raw = os.environ.get("NOIP_COOKIES")
-    path = os.environ.get("NOIP_COOKIE_FILE", "noip-cookies.json")
-    if not raw and os.path.exists(path):
-        with open(path, encoding="utf-8") as fh:
-            raw = fh.read()
+    if not raw and os.path.exists(cookie_path()):
+        raw = open(cookie_path(), encoding="utf-8").read()
     if not raw:
         log("no stored cookie jar")
         return False
     try:
         try:
-            payload = base64.b64decode(raw, validate=True).decode("utf-8")
-            cookies = json.loads(payload)
+            blob = base64.b64decode(raw, validate=True).decode("utf-8")
+            cookies = json.loads(blob)
         except Exception:
             cookies = json.loads(raw)
-        driver.get(HOME_URL)
-        for cookie in cookies:
-            cookie.pop("expiry", None) if cookie.get("expiry") is None else None
-            clean = {k: v for k, v in cookie.items() if k in
-                     ("name", "value", "domain", "path", "secure", "httpOnly", "expiry", "sameSite")}
-            if clean.get("sameSite") not in (None, "Strict", "Lax", "None"):
-                clean.pop("sameSite", None)
-            try:
-                driver.add_cookie(clean)
-            except Exception as exc:
-                log(f"cookie {clean.get('name')} rejected: {exc}")
-        driver.get(HOME_URL)
-        time.sleep(2)
-        log(f"cookie session -> {driver.current_url}")
+        for c in cookies:
+            s.cookies.set(c["name"], c["value"], domain=c.get("domain"), path=c.get("path", "/"))
+        log(f"loaded {len(cookies)} cookies")
         return True
     except Exception as exc:
         log(f"cookie restore failed: {exc}")
         return False
 
 
-def store_cookies(driver):
-    try:
-        cookies = driver.get_cookies()
-    except Exception as exc:
-        log(f"read cookies failed: {exc}")
-        return
-    blob = json.dumps(cookies).encode("utf-8")
-    path = os.environ.get("NOIP_COOKIE_FILE", "noip-cookies.json")
-    with open(path, "wb") as fh:
-        fh.write(blob)
-    log(f"saved {len(cookies)} cookies to {path}")
-    encoded = base64.b64encode(blob).decode("ascii")
-    if os.environ.get("GITHUB_ACTIONS"):
-        # Keep the refreshed jar visible without printing anything else.
-        if os.environ.get("NOIP_COOKIE_OUTPUT"):
-            with open(os.environ["NOIP_COOKIE_OUTPUT"], "w", encoding="utf-8") as fh:
-                fh.write(encoded)
-            log(f"cookie secret written to {os.environ['NOIP_COOKIE_OUTPUT']}")
+def save_cookies(s):
+    cookies = [{"name": c.name, "value": c.value, "domain": c.domain, "path": c.path}
+               for c in s.cookies]
+    with open(cookie_path(), "w", encoding="utf-8") as fh:
+        json.dump(cookies, fh)
+    log(f"saved {len(cookies)} cookies -> {cookie_path()}")
+    out = os.environ.get("NOIP_COOKIE_OUTPUT")
+    if out:
+        with open(out, "w", encoding="utf-8") as fh:
+            fh.write(base64.b64encode(json.dumps(cookies).encode()).decode())
+        log(f"base64 cookie jar -> {out}")
 
 
 # ---------------------------------------------------------------- auth
 
 
-def logged_in(driver):
-    text = (driver.execute_script("return document.body.innerText") or "").lower()
-    url = driver.current_url.lower()
-    if any(k in url for k in ("login", "2fa", "verify")):
-        return False
-    return "sign out" in text or "log out" in text or "my hosts" in text or "dynamic dns" in text
-
-
-def read_2fa_code():
-    code = os.environ.get("NOIP_2FA_CODE")
-    if code:
-        return code.strip()
-    path = os.environ.get("NOIP_2FA_WAIT_FILE")
-    if not path:
+def signed_in(s, url=MY_URL):
+    try:
+        r = s.get(url, timeout=45)
+    except requests.RequestException as exc:
+        log(f"probe {url} failed: {exc}")
         return None
-    log(f"waiting for 2FA code in {path} (up to 10 min)")
-    deadline = time.time() + 600
-    while time.time() < deadline:
-        if os.path.exists(path):
-            value = re.sub(r"\D", "", open(path, encoding="utf-8").read())
-            if len(value) >= 6:
-                return value[:6]
-        time.sleep(2)
+    text = plain(r.text).lower()
+    if "/login" in r.url or "/2fa" in r.url:
+        return None
+    if "log out" in text or "sign out" in text:
+        return r
     return None
 
 
-def complete_2fa(driver):
-    log(f"2FA wall at {driver.current_url}")
-    save(driver, "05-2fa-page.png")
-    code = read_2fa_code()
-    if not code:
-        raise RuntimeError(
-            "No-IP requires email 2FA and no code was supplied "
-            "(set NOIP_2FA_CODE or refresh the trusted-device cookies)"
-        )
-    boxes = [b for b in driver.find_elements(By.CSS_SELECTOR, "input")
-             if b.is_displayed() and (b.get_attribute("type") or "text") in ("text", "tel", "number")]
-    log(f"found {len(boxes)} code boxes")
-    if len(boxes) >= 6:
-        for box, digit in zip(boxes, code):
-            box.send_keys(digit)
-    elif boxes:
-        boxes[0].send_keys(code)
-    else:
-        raise RuntimeError("no 2FA code input found")
-    # Keep "trust this device for 30 days" checked so later runs skip 2FA.
-    try:
-        boxes_trust = driver.find_elements(By.CSS_SELECTOR, "input[type='checkbox']")
-        for cb in boxes_trust:
-            if cb.is_displayed() and not cb.is_selected():
-                driver.execute_script("arguments[0].click();", cb)
-                log("checked 'trust this device'")
-    except Exception as exc:
-        log(f"trust checkbox handling: {exc}")
-
-    submitted = False
-    for how, value in ((By.XPATH, "//button[contains(translate(., 'VERIFY', 'verify'), 'verify')]"),
-                       (By.CSS_SELECTOR, "button[type='submit']"),
-                       (By.XPATH, "//input[@type='submit']")):
-        found = [b for b in driver.find_elements(how, value) if b.is_displayed()]
-        if found:
-            try:
-                driver.execute_script("arguments[0].scrollIntoView({block:'center'});", found[0])
-                time.sleep(0.5)
-                driver.execute_script("arguments[0].click();", found[0])
-                submitted = True
-                break
-            except Exception as exc:
-                log(f"verify click fallback: {exc}")
-    if not submitted:
-        driver.execute_script("document.querySelector('button[type=submit]')?.form?.submit();")
-    time.sleep(8)
-    save(driver, "06-after-2fa.png")
-    if "verify" in driver.current_url.lower():
-        raise RuntimeError("2FA verification did not pass (wrong or expired code)")
-    log(f"2FA passed, now at {driver.current_url}")
+def imap_code(username_hint=None, tries=6):
+    host = os.environ.get("NOIP_IMAP_HOST", "imap.qq.com")
+    port = int(os.environ.get("NOIP_IMAP_PORT", "993"))
+    user = os.environ.get("NOIP_IMAP_USER")
+    password = os.environ.get("NOIP_IMAP_PASS")
+    if not (user and password):
+        return None
+    log(f"reading mailbox {user} for the No-IP code")
+    for attempt in range(tries):
+        try:
+            box = imaplib.IMAP4_SSL(host, port)
+            box.login(user, password)
+            box.select("INBOX")
+            typ, data = box.search(None, "UNSEEN")
+            ids = data[0].split() if data and data[0] else []
+            typ, data = box.search(None, '(FROM "noip")')
+            ids = sorted(set(ids) | set((data[0].split() if data and data[0] else [])))[-8:]
+            for msg_id in reversed(ids):
+                typ, payload = box.fetch(msg_id, "(RFC822)")
+                if typ != "OK":
+                    continue
+                msg = email.message_from_bytes(payload[0][1])
+                body = ""
+                if msg.is_multipart():
+                    for part in msg.walk():
+                        if part.get_content_type() in ("text/plain", "text/html"):
+                            body += part.get_payload(decode=True).decode("utf-8", "ignore")
+                else:
+                    body = msg.get_payload(decode=True).decode("utf-8", "ignore")
+                subject = str(msg.get("Subject", ""))
+                if "no-ip" not in (subject + body).lower():
+                    continue
+                m = re.search(r"(?<!\d)(\d{6})(?!\d)", plain(body))
+                if m:
+                    log(f"code found in mailbox: {m.group(1)}")
+                    box.logout()
+                    return m.group(1)
+            box.logout()
+        except Exception as exc:
+            log(f"imap attempt {attempt + 1} failed: {exc}")
+        time.sleep(10)
+    return None
 
 
-def login(driver, username, password):
-    log(f"opening {LOGIN_URL}")
-    try:
-        driver.get(LOGIN_URL)
-    except TimeoutException as exc:
-        log(f"login page timeout: {exc}")
-    time.sleep(2)
-    save(driver, "01-login-page.png")
+def twofa_code():
+    code = os.environ.get("NOIP_2FA_CODE")
+    if code:
+        return re.sub(r"\D", "", code)[:6]
+    path = os.environ.get("NOIP_2FA_WAIT_FILE")
+    if path:
+        log(f"waiting for the 6-digit code in {path} (max 10 min)")
+        deadline = time.time() + 600
+        while time.time() < deadline:
+            if os.path.exists(path):
+                value = re.sub(r"\D", "", open(path, encoding="utf-8").read())
+                if len(value) >= 6:
+                    return value[:6]
+            time.sleep(2)
+        return None
+    return imap_code()
 
-    user_box = driver.find_element(By.NAME, "username")
-    pass_box = driver.find_element(By.NAME, "password")
-    user_box.clear()
-    user_box.send_keys(username)
-    pass_box.clear()
-    pass_box.send_keys(password)
 
-    clicked = False
-    for how, value in ((By.CSS_SELECTOR, "button[type='submit']"),
-                       (By.XPATH, "//button[contains(translate(., 'LOGIN', 'login'), 'log in')]"),
-                       (By.XPATH, "//input[@type='submit']")):
-        for el in driver.find_elements(how, value):
-            if el.is_displayed():
-                el.click()
-                clicked = True
-                break
-        if clicked:
-            break
-    if not clicked:
-        driver.execute_script("document.querySelector('input[name=submit_login_page]')?.form?.submit();")
-    time.sleep(5)
-    save(driver, "02-after-login.png")
-    if DEBUG > 1:
-        dump_page(driver, "02-after-login.html")
+def login(s, username, password):
+    r = s.get(LOGIN_URL, timeout=45)
+    dump("01-login.html", r.text)
+    payload = {
+        "username": username,
+        "password": password,
+        "_token": token_of(r.text) or "",
+        "submit_login_page": "1",
+        "intended_hash": "",
+        "should_show_questionnaire": "",
+    }
+    r = s.post(LOGIN_URL, data=payload, timeout=60,
+               headers={"Referer": LOGIN_URL, "Origin": BASE})
+    log(f"POST /login -> {r.status_code} {r.url}")
+    dump("02-after-login.html", r.text)
 
-    if "login" in driver.current_url.lower():
-        raise RuntimeError("login failed - wrong username/password, or a changed login form")
-    if "2fa" in driver.current_url.lower() or "verify" in driver.current_url.lower():
-        complete_2fa(driver)
-    log(f"authenticated, now at {driver.current_url}")
+    if "/2fa" in r.url or "challenge_form" in r.text:
+        log("e-mail 2FA challenge")
+        code = twofa_code()
+        if not code:
+            raise RuntimeError(
+                "2FA code unavailable: pass NOIP_2FA_CODE, use NOIP_2FA_WAIT_FILE, "
+                "or configure the NOIP_IMAP_* secrets"
+            )
+        r = s.post(VERIFY_URL, data={
+            "_token": token_of(r.text) or "",
+            "type": "email_pin",
+            "challenge_code": code,
+            "trust_device": "1",
+        }, timeout=60, headers={"Referer": VERIFY_URL, "Origin": BASE})
+        log(f"POST /2fa/verify -> {r.status_code} {r.url}")
+        dump("03-after-2fa.html", r.text)
+        if "challenge_form" in r.text:
+            raise RuntimeError("2FA rejected (wrong or expired code)")
+
+    probe = signed_in(s)
+    if not probe:
+        raise RuntimeError("still signed out after login (see artifacts)")
+    dump("04-dashboard.html", probe.text)
+    log("signed in")
 
 
 # ---------------------------------------------------------------- hosts
 
 
-def visit_hosts(driver):
-    for url in HOST_URLS:
-        log(f"opening {url}")
-        try:
-            driver.get(url)
-        except TimeoutException as exc:
-            log(f"hosts page timeout: {exc}")
-        time.sleep(3)
-        text = driver.execute_script("return document.body.innerText") or ""
-        if re.search(r"expire", text, re.I):
-            log(f"hosts content found at {driver.current_url}")
-            save(driver, "07-hosts-page.png")
-            dump_page(driver, "07-hosts.html")
-            return text
-    save(driver, "07-hosts-page-fallback.png")
-    dump_page(driver, "07-hosts.html")
-    raise RuntimeError("no hosts/expiry content found on my.noip.com")
+HOSTNAME_RE = re.compile(r"[a-z0-9-]+\.(?:noip\.com|noip\.org|noip\.me|ddns\.net|mynetgear\.com)", re.I)
 
 
-def confirm_hosts(driver):
-    buttons = []
-    for how, value in (
-        (By.XPATH, "//button[contains(translate(., 'CONFIRM', 'confirm'), 'confirm')]"),
-        (By.XPATH, "//a[contains(translate(., 'CONFIRM', 'confirm'), 'confirm')]"),
-        (By.CSS_SELECTOR, "input[value*='Confirm' i]"),
-    ):
-        for el in driver.find_elements(how, value):
-            if el.is_displayed() and el not in buttons:
-                buttons.append(el)
-    log(f"found {len(buttons)} confirm control(s)")
-    confirmed = 0
-    for idx, btn in enumerate(buttons, 1):
-        label = (btn.text or btn.get_attribute("value") or "").strip()
+def find_hosts(s):
+    pages = {}
+    for name, url in (("dashboard", MY_URL), ("records", RECORDS_URL), ("legacy", LEGACY_RECORDS)):
         try:
-            log(f"clicking confirm {idx}: {label!r}")
-            driver.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
-            time.sleep(0.5)
-            btn.click()
-            time.sleep(3)
-            save(driver, f"08-confirm-{idx}.png")
-            confirmed += 1
-        except Exception as exc:
-            log(f"confirm {idx} failed: {exc}")
-            save(driver, f"08-confirm-{idx}-error.png")
-    return confirmed
+            r = s.get(url, timeout=45)
+        except requests.RequestException as exc:
+            log(f"{name}: {exc}")
+            continue
+        pages[name] = r.text
+        dump(f"05-{name}.html", r.text)
+        names = sorted(set(HOSTNAME_RE.findall(plain(r.text))))
+        log(f"{name}: {r.status_code}, hostnames {names}")
+    return pages
+
+
+def expiry_days(pages):
+    found = {}
+    for name, html in pages.items():
+        text = plain(html)
+        for line in text.splitlines():
+            m = re.search(r"(\S+\.(?:noip\.com|noip\.org|noip\.me|ddns\.net|mynetgear\.com)).{0,60}expire[sd]? (?:in )?(\d+)", line, re.I)
+            if m:
+                found[m.group(1).lower()] = int(m.group(2))
+        for m in re.finditer(r"expire[sd]? in (\d+) days", text, re.I):
+            found.setdefault("_page", int(m.group(1)))
+    return found
+
+
+def confirm_targets(html):
+    """Return confirm controls on the page: ('form'|'link', url, data, label)."""
+    targets = []
+    for form in re.finditer(r"<form[^>]*>(.*?)</form>", html or "", re.S | re.I):
+        head = re.match(r"<form[^>]*>", form.group(0), re.I).group(0)
+        action_m = re.search(r'action="([^"]*)"', head, re.I)
+        action = action_m.group(1) if action_m else ""
+        if "confirm" not in (action + form.group(1)).lower():
+            continue
+        method = (re.search(r'method="([^"]*)"', head, re.I) or [None, "post"])[1]
+        data = {}
+        for inp in re.finditer(r"<input[^>]*>", form.group(1), re.I):
+            nm = re.search(r'name="([^"]*)"', inp.group(0))
+            vl = re.search(r'value="([^"]*)"', inp.group(0))
+            if nm:
+                data[nm.group(1)] = vl.group(1) if vl else ""
+        label = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", form.group(0))).strip()[:80]
+        targets.append(("form", action, {"method": method.lower(), "data": data}, label))
+
+    for a in re.finditer(r'(<a[^>]*href="([^"]*)"[^>]*>)(.*?)</a>', html or "", re.S | re.I):
+        href, inner = a.group(2), a.group(3)
+        label = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", inner)).strip()
+        # Only an action link counts: the href itself must be a confirm endpoint.
+        # Doc links such as "Free Hostname Confirmation Timeline" are noise.
+        if not re.search(r"confirm", href, re.I):
+            continue
+        if re.search(r"knowledgebase|support|/faq|upgrade|skip 30-day|privacy|cookie", href + label, re.I):
+            continue
+        if not re.search(r"confirm", label, re.I) and "host" not in href.lower():
+            continue
+        targets.append(("link", href, {}, label[:80]))
+
+    for b in re.finditer(r"<button[^>]*>(.*?)</button>", html or "", re.S | re.I):
+        label = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", b.group(1))).strip()
+        if re.search(r"^confirm", label, re.I):
+            onclick = re.search(r'onclick="([^"]*)"', b.group(0), re.I)
+            targets.append(("button", onclick.group(1) if onclick else "", {}, label[:80]))
+    return targets
+
+
+def submit_target(s, target):
+    kind, url, meta, label = target
+    log(f"confirm control: {kind} {label!r}")
+    if kind == "form":
+        full = url if url.startswith("http") else "https://my.noip.com" + url
+        if meta.get("method") == "get":
+            r = s.get(full, params=meta.get("data"), timeout=45)
+        else:
+            r = s.post(full, data=meta.get("data"), timeout=45,
+                       headers={"Referer": MY_URL, "Origin": "https://my.noip.com"})
+        log(f"POST confirm -> {r.status_code} {r.url}")
+        dump("07-after-confirm.html", r.text)
+        return r
+    if kind == "link":
+        full = url if url.startswith("http") else "https://my.noip.com" + url
+        r = s.get(full, timeout=45)
+        log(f"GET confirm link -> {r.status_code} {r.url}")
+        dump("07-after-confirm.html", r.text)
+        return r
+    raise RuntimeError(f"confirm control {label!r} is JS-driven; needs manual handling")
 
 
 def run(argv=None):
@@ -337,35 +359,47 @@ def run(argv=None):
     args = parser.parse_args(argv)
     DEBUG = args.debug
     if not args.username or not args.password:
-        parser.error("username/password required (--username/--password or NOIP_USERNAME/NOIP_PASSWORD)")
+        parser.error("username/password required (NOIP_USERNAME / NOIP_PASSWORD)")
 
-    log(f"debug level: {DEBUG}")
-    driver = build_driver()
-    rc = 0
+    s = session()
     try:
-        if load_cookies(driver) and logged_in(driver):
-            log("reused trusted session, 2FA skipped")
+        if load_cookies(s) and signed_in(s):
+            log("reused trusted-device session (no 2FA)")
         else:
-            login(driver, args.username, args.password)
-        store_cookies(driver)
+            login(s, args.username, args.password)
+        save_cookies(s)
 
-        text = visit_hosts(driver)
-        for m in re.finditer(r"([^\n]{0,90}expire[^\n]{0,60})", text, re.I):
-            log(f"row: {m.group(1).strip()[:140]}")
-        confirmed = confirm_hosts(driver)
-        save(driver, "09-final.png")
-        log(f"CONFIRMED_HOSTS={confirmed}")
+        pages = find_hosts(s)
+        hosts = sorted(set(HOSTNAME_RE.findall(plain("".join(pages.values()))) ) - {"www.noip.com", "my.noip.com"})
+        log(f"free hostnames: {hosts}")
+        days = expiry_days(pages)
+        if days:
+            log(f"expiry info: {days}")
+        if not hosts:
+            raise RuntimeError("no free hostname found on the account pages")
+
+        targets = []
+        for name, html in pages.items():
+            for t in confirm_targets(html):
+                targets.append(t)
+        log(f"confirm controls on page: {len(targets)}")
+        if not targets:
+            log("RESULT=NOTHING_TO_CONFIRM (the Confirm button shows from day 23 of the 30-day cycle)")
+            return 0
+
+        done = 0
+        for t in targets:
+            try:
+                r = submit_target(s, t)
+                if r is not None and "expire" not in plain(r.text).lower():
+                    done += 1
+            except Exception as exc:
+                log(f"confirm failed: {exc}")
+        log(f"RESULT=CONFIRMED step(s)={done}/{len(targets)}")
+        return 0 if done else 3
     except Exception as exc:
-        rc = 3
         log(f"ERROR: {exc}")
-        try:
-            save(driver, "99-error.png")
-            dump_page(driver, "99-error.html")
-        except Exception:
-            pass
-    finally:
-        driver.quit()
-    return rc
+        return 3
 
 
 if __name__ == "__main__":
