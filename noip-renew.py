@@ -169,7 +169,7 @@ def signed_in(s, url=MY_URL):
     return None
 
 
-def imap_code(tries=12, max_age_minutes=20, min_time=None):
+def imap_code(tries=12, max_age_minutes=20, min_time=None, exclude=None):
     """Read the No-IP verification code that arrived after min_time.
 
     No-IP puts the code in the subject ("No-IP Verification Code: 123456"), so
@@ -204,13 +204,13 @@ def imap_code(tries=12, max_age_minutes=20, min_time=None):
                         age = (datetime.now(timezone.utc) - when).total_seconds() / 60
                         if age > max_age_minutes:
                             continue
-                        if min_time and when < min_time - timedelta(seconds=90):
+                        if min_time and when < min_time - timedelta(seconds=5):
                             log(f"skip pre-login mail ({int(age)} min old): {subject.strip()[:50]}")
                             continue
                     except Exception:
                         pass
                 m = re.search(r"(?<!\d)(\d{6})(?!\d)", subject)
-                if m:
+                if m and not (exclude and m.group(1) in exclude):
                     log(f"code from subject: {m.group(1)} ({subject.strip()[:60]})")
                     box.store(msg_id, "+FLAGS", "\\Seen")
                     box.logout()
@@ -240,7 +240,7 @@ def imap_code(tries=12, max_age_minutes=20, min_time=None):
     return None
 
 
-def twofa_code(min_time=None):
+def twofa_code(min_time=None, exclude=None):
     code = os.environ.get("NOIP_2FA_CODE")
     if code:
         return re.sub(r"\D", "", code)[:6]
@@ -255,7 +255,7 @@ def twofa_code(min_time=None):
                     return value[:6]
             time.sleep(2)
         return None
-    return imap_code(min_time=min_time)
+    return imap_code(min_time=min_time, exclude=exclude)
 
 
 def login(s, username, password):
@@ -277,22 +277,32 @@ def login(s, username, password):
 
     if "/2fa" in r.url or "challenge_form" in r.text:
         log("e-mail 2FA challenge")
-        code = twofa_code(login_started)
-        if not code:
-            raise RuntimeError(
-                "2FA code unavailable: pass NOIP_2FA_CODE, use NOIP_2FA_WAIT_FILE, "
-                "or configure the NOIP_IMAP_* secrets"
-            )
-        r = post_with_retry(s, VERIFY_URL, {
-            "_token": token_of(r.text) or "",
-            "type": "email_pin",
-            "challenge_code": code,
-            "trust_device": "1",
-        }, headers={"Referer": VERIFY_URL, "Origin": BASE})
-        log(f"POST /2fa/verify -> {r.status_code} {r.url}")
-        dump("03-after-2fa.html", r.text)
-        if "challenge_form" in r.text:
-            raise RuntimeError("2FA rejected (wrong or expired code)")
+        used = set()
+        challenge_token = token_of(r.text) or ""
+        last = None
+        for attempt in range(1, 4):
+            code = twofa_code(login_started, exclude=used)
+            if not code:
+                raise RuntimeError(
+                    "2FA code unavailable: pass NOIP_2FA_CODE, use NOIP_2FA_WAIT_FILE, "
+                    "or configure the NOIP_IMAP_* secrets"
+                )
+            used.add(code)
+            last = post_with_retry(s, VERIFY_URL, {
+                "_token": challenge_token,
+                "type": "email_pin",
+                "challenge_code": code,
+                "trust_device": "1",
+            }, headers={"Referer": VERIFY_URL, "Origin": BASE})
+            log(f"POST /2fa/verify -> {last.status_code} {last.url} (code {code}, try {attempt})")
+            dump(f"03-after-2fa-{attempt}.html", last.text)
+            if "challenge_form" not in last.text:
+                r = last
+                break
+            log("code rejected, waiting for a newer verification mail")
+            time.sleep(10)
+        else:
+            raise RuntimeError("2FA rejected 3 times (see artifacts)")
 
     probe = signed_in(s)
     if not probe:
